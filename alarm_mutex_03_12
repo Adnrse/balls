@@ -1,0 +1,342 @@
+/*
+ * alarm_mutex.c
+ *
+ * This is an enhancement to the alarm_thread.c program, which
+ * created an "alarm thread" for each alarm command. This new
+ * version uses a single alarm thread, which reads the next
+ * entry in a list. The main thread places new requests onto the
+ * list, in order of absolute expiration time. The list is
+ * protected by a mutex, and the alarm thread sleeps for at
+ * least 1 second, each iteration, to ensure that the main
+ * thread can lock the mutex to add new work to the list.
+ */
+#include <pthread.h>
+#include <time.h>
+#include "errors.h"
+
+/*
+ * The "alarm" structure now contains the time_t (time since the
+ * Epoch, in seconds) for each alarm, so that they can be
+ * sorted. Storing the requested number of seconds would not be
+ * enough, since the "alarm thread" cannot tell how long it has
+ * been on the list.
+ */
+
+//Alarm requests/keywords- Zachary Irland 02/22
+    const int possibleRequests=2;
+    const char *requests[2]={
+        "Start_Alarm",
+        "Cancel_Alarm"};
+
+typedef struct alarm_tag {
+    struct alarm_tag    *link;
+    int                 seconds;
+    time_t              time;   /* seconds from EPOCH */
+    char                message[64];
+
+    // Zachary Ireland 02/22
+    char Message_Category[8];
+    int Alarm_ID;
+    
+    // // Zachary Ireland 03/07
+    // struct alarm_tag *nxt;
+    // struct alarm_tag *prv;
+} alarm_t;
+
+// Zachary Ireland 03/07
+typedef struct thread_tag
+{
+    struct thread_tag   *link;
+    char                Message_Category[8];
+    int                 Thread_ID;
+    pthread_t           thread;
+
+    // struct alarm_tag **head;
+    // struct thread_tag *nxt;
+    // struct thread_tag *prv;
+    // struct alarm_tag    *link;
+} thread_l;
+
+pthread_mutex_t alarm_mutex = PTHREAD_MUTEX_INITIALIZER;
+alarm_t *alarm_list = NULL;
+
+thread_l *thread_List = NULL;
+
+/*
+ * Angelica MacMullin
+ * Variable which holds the thread ID
+ */
+int ID;
+
+/*
+ * The alarm thread's start routine.
+ */
+void *alarm_thread (void *arg)
+{
+    alarm_t *alarm;
+    int sleep_time;
+    time_t now;
+    int status;
+
+    /*
+     * Angelica MacMullin
+     * Get thread ID
+     */
+    ID = (int)pthread_self();
+
+    /*
+     * Loop forever, processing commands. The alarm thread will
+     * be disintegrated when the process exits.
+     */
+    while (1) {
+        status = pthread_mutex_lock (&alarm_mutex);
+        if (status != 0)
+            err_abort (status, "Lock mutex");
+        alarm = alarm_list;
+        /*
+         * If the alarm list is empty, wait for one second. This
+         * allows the main thread to run, and read another
+         * command. If the list is not empty, remove the first
+         * item. Compute the number of seconds to wait -- if the
+         * result is less than 0 (the time has passed), then set
+         * the sleep_time to 0.
+         */
+        if (alarm == NULL)
+            sleep_time = 1;
+        else {
+            alarm_list = alarm->link;
+            now = time (NULL);
+            if (alarm->time <= now)
+                sleep_time = 0;
+            else
+                sleep_time = alarm->time - now;
+#ifdef DEBUG
+            printf ("[waiting: %d(%d)\"%s\"]\n", alarm->time,
+                sleep_time, alarm->message);
+#endif
+            }
+
+        /*
+         * Unlock the mutex before waiting, so that the main
+         * thread can lock it to insert a new alarm request. If
+         * the sleep_time is 0, then call sched_yield, giving
+         * the main thread a chance to run if it has been
+         * readied by user input, without delaying the message
+         * if there's no input.
+         */
+        status = pthread_mutex_unlock (&alarm_mutex);
+        if (status != 0)
+            err_abort (status, "Unlock mutex");
+        if (sleep_time > 0)
+            sleep (sleep_time);
+        else
+            sched_yield ();
+
+        /*
+         * If a timer expired, print the message and free the
+         * structure.
+         */
+        if (alarm != NULL) {
+            printf ("(%d) %s\n", alarm->seconds, alarm->message);
+            free (alarm);
+        }
+    }
+}
+
+// returns Alarm if it exist, returns a null otherwise
+alarm_t *get_AlarmByID(int ID)
+{ // Zachary Ireland 03/07
+    alarm_t **last, *next;
+
+    last = &alarm_list;
+    next = *last;
+    while (next != NULL)
+    {
+        if (next->Alarm_ID == ID)
+        {
+            break;
+        }
+        last = &next->link;
+        next = next->link;
+    }
+    return next;
+}
+
+int main (int argc, char *argv[])
+{
+    int status;
+    char line[128];
+    alarm_t *alarm, **last, *next;
+    thread_l *tAlarm, **tLast, *tNext;
+    pthread_t thread;   
+    while (1) {
+        printf ("alarm> ");
+        if (fgets (line, sizeof (line), stdin) == NULL) 
+            exit (0);
+        if (strlen (line) <= 1) 
+            continue;
+        
+        alarm = (alarm_t*)malloc (sizeof (alarm_t));
+        if (alarm == NULL)
+            errno_abort ("Allocate alarm");
+
+        tAlarm = (thread_l *)malloc(sizeof(thread_l));
+        if (tAlarm == NULL)
+            errno_abort("Allocate alarm");
+
+        //*Zachary Ireland  Start 02/22*/
+        char arguments[128];
+        char command[64];
+        char request[8];
+        // Angelica MacMullin
+        int  i, requestNum = -1;
+        char empty[128];
+
+        /*Zachary Ireland 02/22
+         *Splits Line into two, either side of ':'
+         * left side of ':' is the command includes request and alarm id
+         * right side of ':' everything till end of the line
+         *
+         * if no ':' everything gets placed into comand
+         * does not break with  "Cancel_Alarm(Alarm_ID)"
+         * 
+         * Angelica MacMullin
+         * Empty arguments array
+         */
+        strcpy(arguments, empty);
+        sscanf(line, "%[^:]:%[^\n]",
+               command, arguments);
+
+        printf("%s\n", arguments);
+
+        /*Zachary Ireland 02/22
+         *Splits command into Request and Alarm Id
+         *%[^(] takes everything to the left Of'(' and places into request
+         *
+         *(%d[^)] takes number between '(' and ')' places into AlarmId
+         *
+         *reminder sscanf needs a pointer(&) to handle int
+         */
+        sscanf(command, "%[^(](%d[^)]",
+               request, &alarm->Alarm_ID);
+
+        // strcmp(check,input)
+        for (i = 0; i < possibleRequests; i++)
+        {
+            if (strcmp(requests[i], request) == 0)
+            {
+                requestNum = i;
+            }
+        }
+
+        /*Zachary Ireland 02/22
+         *Parse input line into seconds (%d), Message_Category(%s) and a message
+         * (%s) Message_Category seperated from seconds by Whitespace.
+         * (%128[^\n]), consisting of up to 128 characters
+         * separated from the Message_Category by whitespace.
+         *
+         */
+
+        if ((sscanf(arguments, "%d %s %128[^\n]", &alarm->seconds, alarm->Message_Category, alarm->message) < 3)
+            || requestNum != 0) {
+                if (!(strcmp(arguments, empty)) || requestNum != 1) {
+                    fprintf(stderr, "Bad command\n");
+                    free(alarm);   
+                }
+        }
+        else {
+            status = pthread_mutex_lock (&alarm_mutex);
+            if (status != 0)
+                err_abort (status, "Lock mutex");
+            alarm->time = time (NULL) + alarm->seconds;
+
+            // Start_Alarm
+            if (requestNum == 0) {
+                /* Angelica MacMullin
+                 * Insert the new alarm into the list of alarms,
+                 * sorted by alarm ID.
+                 */
+                last = &alarm_list;
+                next = *last;
+                while(next != NULL) {
+                    if (next->Alarm_ID >= alarm->Alarm_ID) {
+                        alarm->link = next;
+                        *last = alarm;
+                        break;
+                    }
+                    last = &next->link;
+                    next = next->link;
+                }
+                /*
+                 * If we reached the end of the list, insert the new
+                 * alarm there. ("next" is NULL, and "last" points
+                 * to the link field of the last item, or to the
+                 * list header).
+                 */
+                 
+                if (next == NULL) {
+                    *last = alarm;
+                    alarm->link = NULL;
+                }
+
+                printf("\nAlarm(%d) Inserted by Main Thread(%d) Into Alarm List at %ld: %d %s\n",
+                        alarm->Alarm_ID, (int)pthread_self(), time(NULL), alarm->seconds, alarm->message);
+
+                /*
+                 * Angelica MacMullin
+                 * Check if there is already a display alarm thread created for the given
+                 * Message Category
+                 */
+                tLast = &thread_List;
+                tNext = *tLast;
+                while(tNext != NULL) {
+                    if (!strcmp(tNext->Message_Category, alarm->Message_Category)) {
+                        tAlarm->link = tNext;
+                        *tLast = tAlarm;
+                        break;
+                    }
+
+                    tLast = &tNext->link;
+                    tNext = tNext->link;
+                }
+
+                /*
+                 * Angelica MacMullin
+                 * If there is no display alarm thread for the specified Message Category,
+                 * create a new display alarm thread
+                 */
+                if (tNext == NULL) {
+                    status = pthread_create (
+                        &tAlarm->thread, NULL, alarm_thread, NULL);
+                    if (status != 0)
+                        err_abort (status, "Create alarm thread");
+                    
+                    strcpy(tAlarm->Message_Category, alarm->Message_Category);
+                    tAlarm->link = NULL;
+
+                    *tLast = tAlarm;
+
+                    printf("Created New Display Alarm Thread %d for Message_Category %s to Display Alarm %d at %ld: %d %s\n\n",
+                        ID, tAlarm->Message_Category, alarm->Alarm_ID, time(NULL), alarm->seconds, alarm->message);
+                }
+
+            }
+            // Cancel Alarm
+            else{
+      
+            }
+            
+
+#ifdef DEBUG
+            printf ("[list: ");
+            for (next = alarm_list; next != NULL; next = next->link)
+                printf ("%d(%d)[\"%s\"] ", next->time,
+                    next->time - time (NULL), next->message);
+            printf ("]\n");
+#endif
+            status = pthread_mutex_unlock (&alarm_mutex);
+            if (status != 0)
+                err_abort (status, "Unlock mutex");
+        }
+    }
+}
